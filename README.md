@@ -24,3 +24,4 @@ Everything is currently fetched by parsing the HTML of Twitter's main site,
 as it doesn't require authentication and doesn't rate-limit as aggressively
 as the API, which is a sad state for a modern service.
 
+**This project is not maintained.**
