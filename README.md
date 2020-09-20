@@ -5,7 +5,7 @@ An ActivityPub gateway for Twitter.
 Currently features:
 
 - Profiles
-- Tweets and conversations, including emojis, links, mentions and images
+- Tweets and conversations, including emojis, links, mentions ~~and images~~
 - Redirections to Twitter for browsers
 - A minimal web interface to generate new URLs
 
@@ -23,5 +23,3 @@ serve an ActivityPub server-to-server API.
 Everything is currently fetched by parsing the HTML of Twitter's main site,
 as it doesn't require authentication and doesn't rate-limit as aggressively
 as the API, which is a sad state for a modern service.
-
-**This project is not maintained.**
