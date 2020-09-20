@@ -2,7 +2,7 @@ package main
 
 import (
 	"bytes"
-	"compress/zlib"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -24,6 +24,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	twitterscraper "github.com/n0madic/twitter-scraper"
 )
 
 type Config struct {
@@ -175,7 +176,6 @@ func tw_get_user(inst InstanceCtx, name string) (*LocalAccount, error) {
 	ttl := 30 * time.Minute
 	tweet_ttl := 30 * time.Minute
 
-	twitter_url := fmt.Sprintf("https://twitter.com/%s", name)
 	var user LocalAccount
 
 	name = strings.ToLower(name)
@@ -194,89 +194,73 @@ func tw_get_user(inst InstanceCtx, name string) (*LocalAccount, error) {
 	inst.Stats.DbAccountMiss++
 	log.Printf("tw_get_user(%s): db miss", name)
 
-	resp, err := http.Get(twitter_url)
+	profile, err := twitterscraper.GetProfile(name)
 	if err != nil {
-		return nil, errors.New(fmt.Sprintf("error querying page: %s", err))
+		return nil, errors.New(fmt.Sprintf("error querying profile: %s", err))
 	}
-
-	flated, err := zlib.NewReader(resp.Body)
-	if err != nil {
-		return nil, errors.New(fmt.Sprintf("error parsing page: %s", err))
-	}
-	doc, err := goquery.NewDocumentFromReader(flated)
-	if err != nil {
-		return nil, errors.New(fmt.Sprintf("error parsing page: %s", err))
-	}
-
-	username := doc.Find(".ProfileSidebar .username b").Text()
-
-	user.Name = username
-	user.DisplayName = doc.Find(".ProfileHeaderCard-name a").Text()
-	user.AvatarUrl = doc.Find(".ProfileAvatar-image").AttrOr("src", "")
-	user.Bio = doc.Find(".ProfileHeaderCard-bio").Text()
+	user.Name = profile.Username
+	user.DisplayName = profile.Name
+	user.AvatarUrl = profile.Avatar
+	user.Bio = profile.Biography
 	user.LastUpdate = time.Now().UTC()
 
 	var statuses []LocalTweet
-	doc.Find(".tweet").Each(func(i int, s *goquery.Selection) {
-		str_id, _ := s.Attr("data-tweet-id")
-		_id, err := strconv.ParseInt(str_id, 10, 64)
-		if err != nil {
-			log.Printf("error reading tweet id: %s: %s", str_id, err)
-			return
+	for tweet := range twitterscraper.GetTweets(context.Background(), name, 50) {
+		if tweet.Error != nil {
+			return nil, errors.New(fmt.Sprintf("error querying tweet: %s", tweet.Error))
 		}
 
-		id := uint64(_id)
-		tweet := LocalTweet{TweetId: id}
+		tid, _ := strconv.ParseInt(tweet.ID, 10, 64)
+		id := uint64(tid)
+		dbtweet := LocalTweet{TweetId: id}
 
 		if id > user.LastTweetId {
 			user.LastTweetId = id
 		}
 
-		tweet_hit, err := inst.DB.Sql("select * from local_tweet where tweet_id=?", id).Get(&tweet)
+		tweet_hit, err := inst.DB.Sql("select * from local_tweet where tweet_id=?", id).Get(&dbtweet)
 		if err != nil {
 			log.Fatalf("db error: %s", err.Error())
 		}
-		if tweet_hit && tweet.LastUpdate.After(time.Now().UTC().Add(-tweet_ttl)) {
-			statuses = append(statuses, tweet)
-			return
+		if tweet_hit && dbtweet.LastUpdate.After(time.Now().UTC().Add(-tweet_ttl)) {
+			statuses = append(statuses, dbtweet)
+			continue
 		}
 
-		tweet_username := s.Find(".content .account-group .username b").Text()
-
-		if tweet_username == user.Name {
-			tweet.LocalAccountId = user.LocalId
-			tweet.IsBoost = false
+		if tweet.Username == user.Name {
+			dbtweet.LocalAccountId = user.LocalId
+			dbtweet.IsBoost = false
 		} else {
-			tweet.IsBoost = true
+			dbtweet.IsBoost = true
 
 			var su_account LocalAccount
-			su_hit, err := inst.DB.Sql("select local_id from local_account where name=?", tweet_username).Get(&su_account)
+			su_hit, err := inst.DB.Sql("select local_id from local_account where name=?", tweet.Username).Get(&su_account)
 			if err != nil {
 				log.Fatalf("db error: %s", err.Error())
 			}
 			if !su_hit {
-				su_account.Name = tweet_username
-				su_account.DisplayName = s.Find(".content .account-group .FullNameGroup strong").Text()
-				su_account.AvatarUrl = doc.Find(".tweet.js-original-tweet .avatar").AttrOr("src", "")
+				su_account.Name = tweet.Username
+				su_account.DisplayName = profile.Name
+				su_account.AvatarUrl = profile.Avatar
 				inst.DB.Insert(&su_account)
 				// note that we don't set LastUpdate, as it is incomplete
 			}
-			tweet.LocalAccountId = su_account.LocalId
+			dbtweet.LocalAccountId = su_account.LocalId
 		}
 
-		tweet.Content = parse_content(inst, s.Find(".content .tweet-text"), &tweet.Mentions)
-		tweet.PublishTime = parse_timestamp(s.Find(".js-short-timestamp").AttrOr("data-time", ""))
-		tweet.ConversationId = s.AttrOr("data-conversation-id", "")
-		tweet.Attachments = find_attachments(inst, s)
+		dbtweet.Content = tweet.Text
+		dbtweet.PublishTime = time.Unix(tweet.Timestamp, 0)
+		//dbtweet.ConversationId = s.AttrOr("data-conversation-id", "")
+		//dbtweet.Attachments = find_attachments(inst, s)
 
 		if tweet_hit {
-			inst.DB.Update(tweet, LocalTweet{TweetId: id})
+			inst.DB.Update(dbtweet, LocalTweet{TweetId: id})
 		} else {
-			inst.DB.Insert(tweet)
+			inst.DB.Insert(dbtweet)
 		}
 
-		statuses = append(statuses, tweet)
-	})
+		statuses = append(statuses, dbtweet)
+	}
 	user.RecentStatuses = &statuses
 
 	if db_hit {
@@ -290,7 +274,17 @@ func tw_get_user(inst InstanceCtx, name string) (*LocalAccount, error) {
 
 func tw_get_status(inst InstanceCtx, username string, id string) (*LocalTweet, error) {
 	ttl := 30 * time.Minute
-	twitter_url := fmt.Sprintf("https://twitter.com/%s/status/%s", username, id)
+
+	lastId, _ := strconv.ParseInt(id, 10, 64)
+	lastTweetID := strconv.FormatInt(lastId-1, 10)
+
+	tweets, err := twitterscraper.FetchTweets(username, lastTweetID)
+	if err != nil {
+		return nil, errors.New(fmt.Sprintf("error querying tweet: %s", err))
+	}
+	if len(tweets) == 0 {
+		return nil, errors.New("error querying tweet: not found")
+	}
 
 	var tweet LocalTweet
 
@@ -308,35 +302,17 @@ func tw_get_status(inst InstanceCtx, username string, id string) (*LocalTweet, e
 	inst.Stats.DbTweetMiss++
 	log.Printf("tw_get_status(%s, %s): db miss", username, id)
 
-	resp, err := http.Get(twitter_url)
-	if err != nil {
-		return nil, errors.New(fmt.Sprintf("error querying page: %s", err))
-	}
-
-	flated, err := zlib.NewReader(resp.Body)
-	if err != nil {
-		return nil, errors.New(fmt.Sprintf("error parsing page: %s", err))
-	}
-	doc, err := goquery.NewDocumentFromReader(flated)
-	if err != nil {
-		return nil, errors.New(fmt.Sprintf("error parsing page: %s", err))
-	}
-
-	id_i, err := strconv.ParseInt(id, 10, 64)
-	if err != nil {
-		return nil, errors.New(fmt.Sprintf("error reading tweet id: %s: %s", id, err))
-	}
-
-	tweet.Content = parse_content(inst, doc.Find(".tweet.js-original-tweet .tweet-text"), &tweet.Mentions)
-	tweet.TweetId = uint64(id_i)
-	tweet.PublishTime = parse_timestamp(doc.Find(".tweet.js-original-tweet .tweet-timestamp span").AttrOr("data-time", ""))
-	tweet.Retweets, _ = strconv.Atoi(doc.Find(".stats .js-stat-retweets a strong").Text())
-	tweet.Favorites, _ = strconv.Atoi(doc.Find(".stats .js-stat-favorites strong").Text())
-	tweet.ConversationId = doc.Find(".tweet.js-original-tweet").AttrOr("data-conversation-id", "")
+	tweet.Content = tweets[0].Text
+	tid, _ := strconv.ParseInt(tweets[0].ID, 10, 64)
+	tweet.TweetId = uint64(tid)
+	tweet.PublishTime = time.Unix(tweets[0].Timestamp, 0)
+	tweet.Retweets = tweets[0].Retweets
+	tweet.Favorites = tweets[0].Likes
 	tweet.LastUpdate = time.Now().UTC()
-	tweet.Attachments = find_attachments(inst, doc.Find(".tweet.js-original-tweet"))
+	//tweet.ConversationId = doc.Find(".tweet.js-original-tweet").AttrOr("data-conversation-id", "")
+	//tweet.Attachments = find_attachments(inst, doc.Find(".tweet.js-original-tweet"))
 
-	username = doc.Find(".tweet.js-original-tweet").AttrOr("data-screen-name", "")
+	username = tweets[0].Username
 	if strings.HasPrefix(username, "@") {
 		username = username[1:]
 	}
@@ -344,21 +320,25 @@ func tw_get_status(inst InstanceCtx, username string, id string) (*LocalTweet, e
 	var user LocalAccount
 	su_hit, err := inst.DB.Sql("select local_id from local_account where name=?", username).Get(&user)
 	if !su_hit {
-		user.Name = username
-		user.DisplayName = doc.Find(".tweet.js-original-tweet").AttrOr("data-name", "")
-		user.AvatarUrl = doc.Find(".tweet.js-original-tweet .avatar").AttrOr("src", "")
+		profile, err := twitterscraper.GetProfile(username)
+		if err != nil {
+			return nil, errors.New(fmt.Sprintf("error querying profile: %s", err))
+		}
+		user.Name = profile.Username
+		user.DisplayName = profile.Name
+		user.AvatarUrl = profile.Avatar
 		inst.DB.Insert(&user)
 		// note that we don't set LastUpdate, as it is incomplete
 	}
 	tweet.LocalAccountId = user.LocalId
 
-	if doc.Find(".tweet.js-original-tweet").AttrOr("data-has-parent-tweet", "") == "true" {
-		r := doc.Find(".in-reply-to .tweet").Last()
-		r_name := r.AttrOr("data-screen-name", "")
-		r_id := r.AttrOr("data-tweet-id", "")
-		url := fmt.Sprintf("https://%s/%s/status/%s", inst.Domain, r_name, r_id)
-		tweet.ReplyToUrl = &url
-	}
+	//if doc.Find(".tweet.js-original-tweet").AttrOr("data-has-parent-tweet", "") == "true" {
+	//	r := doc.Find(".in-reply-to .tweet").Last()
+	//	r_name := r.AttrOr("data-screen-name", "")
+	//	r_id := r.AttrOr("data-tweet-id", "")
+	//	url := fmt.Sprintf("https://%s/%s/status/%s", inst.Domain, r_name, r_id)
+	//	tweet.ReplyToUrl = &url
+	//}
 
 	if db_hit {
 		inst.DB.Update(&tweet, LocalTweet{TweetId: tweet.TweetId})
