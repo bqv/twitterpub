@@ -33,6 +33,9 @@ type Config struct {
 	DbDriver string
 	DbDsn    string
 	Listen   string
+	TLS      bool
+	CertFile string
+	KeyFile  string
 
 	AccountCacheTtl time.Duration
 	TweetCacheTtl   time.Duration
@@ -771,7 +774,7 @@ func main() {
 
 	r.HandleFunc("/{name}/status/{id}", func(w http.ResponseWriter, r *http.Request) {
 		vars := mux.Vars(r)
-		name := vars["name"]
+		name := strings.TrimPrefix(vars["name"], "@")
 		id := vars["id"]
 
 		url := fmt.Sprintf("https://%s/%s/status/%s", inst.Domain, name, id)
@@ -807,7 +810,7 @@ func main() {
 	})
 	r.HandleFunc("/{name}", func(w http.ResponseWriter, r *http.Request) {
 		vars := mux.Vars(r)
-		name := vars["name"]
+		name := strings.TrimPrefix(vars["name"], "@")
 
 		url := fmt.Sprintf("https://%s/%s", inst.Domain, name)
 		link := fmt.Sprintf("<%s>; rel=\"alternate\"; type=\"application/activity+json\"", url)
@@ -839,7 +842,7 @@ func main() {
 	})
 	r.HandleFunc("/{name}/outbox", func(w http.ResponseWriter, r *http.Request) {
 		vars := mux.Vars(r)
-		name := vars["name"]
+		name := strings.TrimPrefix(vars["name"], "@")
 
 		err := ap_check_headers(r)
 		if err != nil {
@@ -881,5 +884,9 @@ func main() {
 	})
 
 	log.Printf("listening on: %s", inst.Config.Listen)
-	http.ListenAndServe(inst.Config.Listen, Log(r))
+	if inst.Config.TLS {
+		http.ListenAndServeTLS(inst.Config.Listen, inst.Config.CertFile, inst.Config.KeyFile, Log(r))
+	} else {
+		http.ListenAndServe(inst.Config.Listen, Log(r))
+	}
 }
