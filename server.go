@@ -1,19 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"github.com/BurntSushi/toml"
-	"github.com/PuerkitoBio/goquery"
 	"github.com/go-xorm/xorm"
 	"github.com/gorilla/mux"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/patrickmn/go-cache"
-	"html"
 	"html/template"
 	"log"
 	"math"
@@ -88,78 +85,6 @@ type Attachment struct {
 	Type string
 }
 
-func parse_content(inst InstanceCtx, s *goquery.Selection, mentions *[]UserStub) string {
-	text_parts := s.Contents().Map(func(i int, node *goquery.Selection) string {
-		if goquery.NodeName(node) == "#text" {
-			return html.EscapeString(node.Text())
-		} else if goquery.NodeName(node) == "img" {
-			return html.EscapeString(node.AttrOr("alt", ""))
-		} else if goquery.NodeName(node) == "a" {
-			var b bytes.Buffer
-
-			if node.HasClass("twitter-atreply") {
-				name := node.Find("b").First().Text()
-				t := template.Must(template.New("").Parse("<span class=\"h-card\"><a href=\"{{.Url}}\" class=\"u-url mention\">@<span>{{.Name}}</span></a></span>"))
-				t.Execute(&b, map[string]interface{}{
-					"Url":  fmt.Sprintf("https://%s/%s", inst.Domain, name),
-					"Name": name,
-				})
-				*mentions = append(*mentions, UserStub{Name: name})
-			} else {
-				t := template.Must(template.New("").Parse("<a href=\"{{.Url}}\">{{.Url}}</a>"))
-				t.Execute(&b, map[string]interface{}{
-					"Url": node.AttrOr("data-expanded-url", node.AttrOr("href", "")),
-				})
-			}
-			return b.String()
-		}
-		return html.EscapeString(node.Text())
-	})
-	return "<p>" + strings.Join(text_parts, " ") + "</p>"
-}
-
-func find_attachments(inst InstanceCtx, s *goquery.Selection) []Attachment {
-	var r []Attachment
-	s.Find(".AdaptiveMedia-photoContainer").Each(func(i int, node *goquery.Selection) {
-		url := node.AttrOr("data-image-url", "")
-		lurl := strings.ToLower(url)
-		var t string
-		switch {
-		case strings.HasSuffix(lurl, ".jpg") || strings.HasSuffix(lurl, ".jpeg"):
-			t = "image/jpeg"
-		case strings.HasSuffix(lurl, ".png"):
-			t = "image/png"
-		}
-		r = append(r, Attachment{Url: url, Type: t})
-	})
-	return r
-}
-
-func parse_timestamp(s string) time.Time {
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		log.Printf("%s", err)
-		return time.Now().UTC()
-	}
-	t := time.Unix(int64(n), 0).UTC()
-	return t
-}
-
-func query(url string) (*http.Response, error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Add("Accept-Language", "en-GB,en;q=0.8,en-US;q=0.6,fr;q=0.4")
-	req.Header.Set("Cookie", "lang=en-gb")
-	cookie := http.Cookie{Name: "lang", Value: "en-gb"}
-	req.AddCookie(&cookie)
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	return resp, err
-}
-
 func get_recent_statuses(inst InstanceCtx, user LocalAccount) *[]LocalTweet {
 	if user.RecentStatuses != nil {
 		return user.RecentStatuses
@@ -204,6 +129,7 @@ func tw_get_user(inst InstanceCtx, name string) (*LocalAccount, error) {
 	user.Name = profile.Username
 	user.DisplayName = profile.Name
 	user.AvatarUrl = profile.Avatar
+	user.BannerUrl = profile.Banner
 	user.Bio = profile.Biography
 	user.LastUpdate = time.Now().UTC()
 
@@ -245,6 +171,7 @@ func tw_get_user(inst InstanceCtx, name string) (*LocalAccount, error) {
 				su_account.Name = tweet.Username
 				su_account.DisplayName = profile.Name
 				su_account.AvatarUrl = profile.Avatar
+				su_account.BannerUrl = profile.Banner
 				inst.DB.Insert(&su_account)
 				// note that we don't set LastUpdate, as it is incomplete
 			}
@@ -254,7 +181,18 @@ func tw_get_user(inst InstanceCtx, name string) (*LocalAccount, error) {
 		dbtweet.Content = tweet.Text
 		dbtweet.PublishTime = time.Unix(tweet.Timestamp, 0)
 		//dbtweet.ConversationId = s.AttrOr("data-conversation-id", "")
-		//dbtweet.Attachments = find_attachments(inst, s)
+		dbtweet.Attachments = []Attachment{}
+		for _, url := range tweet.Photos {
+			lurl := strings.ToLower(url)
+			var t string
+			switch {
+			case strings.HasSuffix(lurl, ".jpg") || strings.HasSuffix(lurl, ".jpeg"):
+				t = "image/jpeg"
+			case strings.HasSuffix(lurl, ".png"):
+				t = "image/png"
+			}
+			dbtweet.Attachments = append(dbtweet.Attachments, Attachment{Url: url, Type: t})
+		}
 
 		if tweet_hit {
 			inst.DB.Update(dbtweet, LocalTweet{TweetId: id})
@@ -313,7 +251,18 @@ func tw_get_status(inst InstanceCtx, username string, id string) (*LocalTweet, e
 	tweet.Favorites = tweets[0].Likes
 	tweet.LastUpdate = time.Now().UTC()
 	//tweet.ConversationId = doc.Find(".tweet.js-original-tweet").AttrOr("data-conversation-id", "")
-	//tweet.Attachments = find_attachments(inst, doc.Find(".tweet.js-original-tweet"))
+	tweet.Attachments = []Attachment{}
+	for _, url := range tweets[0].Photos {
+		lurl := strings.ToLower(url)
+		var t string
+		switch {
+		case strings.HasSuffix(lurl, ".jpg") || strings.HasSuffix(lurl, ".jpeg"):
+			t = "image/jpeg"
+		case strings.HasSuffix(lurl, ".png"):
+			t = "image/png"
+		}
+		tweet.Attachments = append(tweet.Attachments, Attachment{Url: url, Type: t})
+	}
 
 	username = tweets[0].Username
 	if strings.HasPrefix(username, "@") {
@@ -330,6 +279,7 @@ func tw_get_status(inst InstanceCtx, username string, id string) (*LocalTweet, e
 		user.Name = profile.Username
 		user.DisplayName = profile.Name
 		user.AvatarUrl = profile.Avatar
+		user.BannerUrl = profile.Banner
 		inst.DB.Insert(&user)
 		// note that we don't set LastUpdate, as it is incomplete
 	}
@@ -452,6 +402,7 @@ type APPerson struct {
 	PublicKey                 APPublicKey   `json:"publicKey"`
 	Endpoints                 APEndpoint    `json:"endpoints"`
 	Icon                      APIcon        `json:"icon"`
+	Image                     APIcon        `json:"image"`
 }
 
 type APAttachment struct {
@@ -479,6 +430,12 @@ func ap_person(inst InstanceCtx, user LocalAccount) APPerson {
 			Url:  user.AvatarUrl,
 		},
 		ManuallyApprovesFollowers: false,
+	}
+	if len(strings.TrimSpace(user.BannerUrl)) == 0 {
+		o.Image = APIcon{
+			Type: "Image",
+			Url:  user.BannerUrl,
+		}
 	}
 	return o
 }
@@ -641,6 +598,7 @@ type LocalAccount struct {
 	DisplayName string
 	Bio         string
 	AvatarUrl   string
+	BannerUrl   string
 
 	LastTweetId uint64
 	LastUpdate  time.Time
